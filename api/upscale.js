@@ -1,78 +1,70 @@
 // api/upscale.js
 // Vercel Serverless Function. Receives a base64 image from the frontend,
-// sends it to Replicate's Real-ESRGAN model for upscaling, waits for the
-// result, and returns the output image URL.
+// sends it to Hugging Face's FREE Inference API for super-resolution
+// (swin2SR model), and returns the result as a base64 data URL.
 //
-// Requires an environment variable REPLICATE_API_TOKEN set in your
-// Vercel project settings (never put this key in the frontend code).
+// Hugging Face's Inference API is free with no payment info ever
+// required, but it runs on shared community hardware: the first
+// request after a while can be slow (the model needs to "wake up"),
+// and there's a rate limit on free accounts.
+//
+// Requires an environment variable HF_API_TOKEN set in your Vercel
+// project settings (never put this key in the frontend code).
+
+const MODEL_URL =
+  'https://api-inference.huggingface.co/models/caidas/swin2SR-classical-sr-x4-64';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const { image, scale } = req.body;
+  const { image } = req.body;
 
   if (!image) {
     return res.status(400).json({ error: 'لم يتم إرسال أي صورة' });
   }
 
-  const token = process.env.REPLICATE_API_TOKEN;
+  const token = process.env.HF_API_TOKEN;
   if (!token) {
-    return res.status(500).json({ error: 'REPLICATE_API_TOKEN غير مُعرّف في إعدادات السيرفر' });
+    return res.status(500).json({ error: 'HF_API_TOKEN غير مُعرّف في إعدادات السيرفر' });
   }
 
   try {
-    // 1. Start the prediction (Real-ESRGAN model on Replicate)
-    const createResp = await fetch('https://api.replicate.com/v1/predictions', {
+    const base64Data = image.split(',')[1];
+    const mimeMatch = image.match(/^data:(.+);base64,/);
+    const mimeType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+    const buffer = Buffer.from(base64Data, 'base64');
+
+    const response = await fetch(MODEL_URL, {
       method: 'POST',
       headers: {
-        'Authorization': `Token ${token}`,
-        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': mimeType,
       },
-      body: JSON.stringify({
-        // Real-ESRGAN version hash (check Replicate's model page for the
-        // latest version id if this becomes outdated)
-        version: 'f121d640bd286e1fdc67f9799164c1d5be36ff74576ee11c803ae5b665dd46a',
-        input: {
-          image: image,
-          scale: Number(scale) || 4,
-          face_enhance: false,
-        },
-      }),
+      body: buffer,
     });
 
-    const prediction = await createResp.json();
+    // The free API can return a JSON error (e.g. "model is loading")
+    // instead of an image while it's warming up.
+    const contentType = response.headers.get('content-type') || '';
 
-    if (!createResp.ok) {
-      return res.status(createResp.status).json({ error: prediction.detail || 'فشل بدء المعالجة' });
+    if (!response.ok || contentType.includes('application/json')) {
+      const errData = await response.json().catch(() => ({}));
+      if (errData.estimated_time) {
+        return res.status(503).json({
+          error: `الموديل بيشتغل لأول مرة، استنى حوالي ${Math.ceil(errData.estimated_time)} ثانية وجرّب تاني`,
+        });
+      }
+      return res.status(response.status || 500).json({
+        error: errData.error || 'فشلت عملية رفع الجودة، حاول مرة أخرى',
+      });
     }
 
-    // 2. Poll until the prediction finishes (Replicate processes async)
-    let result = prediction;
-    const maxAttempts = 60; // ~60s * 2 = up to 2 minutes
-    let attempts = 0;
+    const resultBuffer = Buffer.from(await response.arrayBuffer());
+    const outputUrl = `data:image/png;base64,${resultBuffer.toString('base64')}`;
 
-    while (
-      result.status !== 'succeeded' &&
-      result.status !== 'failed' &&
-      result.status !== 'canceled' &&
-      attempts < maxAttempts
-    ) {
-      await new Promise((r) => setTimeout(r, 2000));
-      const pollResp = await fetch(
-        `https://api.replicate.com/v1/predictions/${result.id}`,
-        { headers: { 'Authorization': `Token ${token}` } }
-      );
-      result = await pollResp.json();
-      attempts++;
-    }
-
-    if (result.status !== 'succeeded') {
-      return res.status(500).json({ error: 'فشلت عملية رفع الجودة، حاول مرة أخرى' });
-    }
-
-    return res.status(200).json({ outputUrl: result.output });
+    return res.status(200).json({ outputUrl });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: 'حدث خطأ في السيرفر' });
