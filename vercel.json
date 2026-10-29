@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/upscale.js": {
+      "maxDuration": 60
+    }
+  }
+}
